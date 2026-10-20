@@ -1,0 +1,26 @@
+name: mirror
+on:
+  schedule:
+    - cron: "0 5,11,17,23 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror upstream branches and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euETo pipefail
+          shopt -s inherit_errexit 2>/dev/null || :
+          git clone --quiet --mirror https://git.sr.ht/~alexdavid/jail.nix upstream
+          cd upstream
+          # Keep this repo's own mirror branch (README + workflow) out of the push.
+          git push --quiet --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
