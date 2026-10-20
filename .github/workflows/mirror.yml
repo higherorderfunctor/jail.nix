@@ -1,26 +1,117 @@
 name: mirror
 on:
   schedule:
-    - cron: "0 5,11,17,23 * * *"
+    # Two hours before nix-agentic-tools' 00/06/12/18 dependency sweep.
+    - cron: "0 4,10,16,22 * * *"
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: mirror
   cancel-in-progress: false
+env:
+  # This repository's own branch (README + workflow), never mirrored.
+  META_REF: refs/heads/gh-mirror-meta
+  UPSTREAM: https://git.sr.ht/~alexdavid/jail.nix
 jobs:
-  mirror:
-    runs-on: ubuntu-latest
+  check:
+    runs-on: &runner ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      moved: ${{ steps.compare.outputs.moved }}
     steps:
-      - name: Mirror upstream branches and tags
+      - name: Compare upstream refs with the mirror
+        id: compare
+        run: |
+          set -euETo pipefail
+          shopt -s inherit_errexit 2>/dev/null || :
+          export LC_ALL=C
+          # --refs drops HEAD and peeled tag lines, which are not refs to push.
+          # Refused: an upstream refs/heads/gh-mirror-meta. It is never pushed,
+          # so it never matches this repository's own branch, and counting it
+          # would sync and run the suite every 6 hours with nothing new.
+          git ls-remote --heads --tags --refs "$UPSTREAM" \
+            | awk -v meta="$META_REF" '$2 != meta' | sort > upstream.refs
+          git ls-remote --heads --tags --refs "https://github.com/${GITHUB_REPOSITORY}.git" | sort > mirror.refs
+          # Upstream lines missing verbatim here: a new ref or a moved one. Lines
+          # only here (META_REF, refs deleted upstream) do not count.
+          moved="$(comm -23 upstream.refs mirror.refs)"
+          if [ -n "$moved" ]; then
+            printf '%s\n' "$moved"
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+          fi
+  sync:
+    needs: check
+    if: needs.check.outputs.moved == 'true'
+    runs-on: *runner
+    # The measured probe took 6 minutes; the suite's own timeout below is 10.
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # Pushed before the tests: a failing suite fails the run, not the mirror.
+      - name: Push upstream heads and tags
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euETo pipefail
           shopt -s inherit_errexit 2>/dev/null || :
-          git clone --quiet --mirror https://git.sr.ht/~alexdavid/jail.nix upstream
-          cd upstream
-          # Keep this repo's own mirror branch (README + workflow) out of the push.
+          git clone --quiet --bare "https://github.com/${GITHUB_REPOSITORY}.git" mirror.git
+          cd mirror.git
+          # The mirror's objects make this fetch transfer only upstream's new
+          # ones. The negative refspec keeps an upstream META_REF, should one
+          # appear, out of the push below, so it never overwrites this branch.
+          git fetch --quiet "$UPSTREAM" \
+            '+refs/heads/*:refs/upstream/heads/*' \
+            '+refs/tags/*:refs/upstream/tags/*' \
+            "^$META_REF"
+          # No --prune: a ref deleted upstream stays here.
           git push --quiet --force \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+            'refs/upstream/heads/*:refs/heads/*' 'refs/upstream/tags/*:refs/tags/*'
+      - name: Run upstream's test suite on main
+        run: |
+          set -euETo pipefail
+          shopt -s inherit_errexit 2>/dev/null || :
+          # Only local actions are allowed here, so Nix comes from its installer.
+          curl -fsSL https://nixos.org/nix/install -o "$RUNNER_TEMP/install-nix"
+          sh "$RUNNER_TEMP/install-nix" --daemon --yes > /dev/null
+          # shellcheck disable=SC1091
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          # Upstream's CI pushes the suite's build closure to its Cachix cache.
+          sudo tee -a /etc/nix/nix.conf > /dev/null <<'CONF'
+          experimental-features = nix-command flakes
+          extra-substituters = https://jailnix.cachix.org
+          extra-trusted-public-keys = jailnix.cachix.org-1:jKPbQql/lW6yg/zjd/I9F7tIRj4DKNMdPnflt+Csoh8=
+          CONF
+          sudo systemctl restart nix-daemon
+          # Ubuntu's AppArmor denies unprivileged user namespaces to binaries
+          # without a profile, such as the Nix store's bwrap the suite runs.
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          git clone --quiet --branch main "https://github.com/${GITHUB_REPOSITORY}.git" src
+          cd src
+          nix build --out-link result-tests ./tests#all-for-ci
+          dbus_rev="$(jq -r .nodes.nixpkgs.locked.rev tests/flake.lock)"
+          nix build --out-link result-dbus "github:NixOS/nixpkgs/$dbus_rev#dbus"
+          # NixOS-shaped /etc/ssl, one bundle file. `network` binds every entry,
+          # and Ubuntu's 251 made it emit 1505 bwrap args, failing "does not add
+          # too many bwrap args" (limit 100).
+          cp -L /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/ca.crt"
+          sudo mv /etc/ssl /etc/ssl.ubuntu
+          sudo mkdir -p /etc/ssl/certs
+          sudo cp "$RUNNER_TEMP/ca.crt" /etc/ssl/certs/ca-certificates.crt
+          # jail.nix's unsafe-dbus binds $XDG_RUNTIME_DIR/bus, so the
+          # session bus listens there, in a private runtime directory.
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export XDG_RUNTIME_DIR
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          # Without --config-file, Nix's dbus-daemon reads
+          # /etc/dbus-1/session.conf, which the runner does not have.
+          result-dbus/bin/dbus-daemon --fork \
+            --config-file="$(readlink -f result-dbus)/share/dbus-1/session.conf" \
+            --address="$DBUS_SESSION_BUS_ADDRESS"
+          # SIGINT lets hspec print its failure report if a test hangs.
+          timeout --signal=INT --kill-after=30 600 result-tests/run-tests/bin/run-tests
